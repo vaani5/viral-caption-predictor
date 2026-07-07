@@ -1,0 +1,10 @@
+streamlit>=1.32.0
+scikit-learn>=1.4.0
+xgboost>=2.0.0
+shap>=0.44.0
+pandas>=2.0.0
+numpy>=1.26.0
+vaderSentiment>=3.3.2
+textstat>=0.7.3
+anthropic>=0.25.0
+plotly>=5.20.0
