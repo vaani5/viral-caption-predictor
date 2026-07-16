@@ -72,17 +72,3 @@ Replace `generate_synthetic_training_data()` in `model.py` with:
 
 With real data, expected accuracy: **85–90% F1** on held-out test set.
 
-## Resume bullets
-
-```
-• Built hybrid virality classifier using XGBoost on 8 hand-engineered NLP features
-  (sentiment, readability, power words, length); integrated SHAP TreeExplainer for
-  per-post weakness detection
-
-• Designed structured LLM rewrite pipeline using Anthropic Claude API — feeds
-  ML-detected weaknesses as explicit prompt instructions, producing platform-aware
-  rewrites in <2 seconds
-
-• Deployed as 3-panel Streamlit app with iterative re-scoring loop supporting
-  Twitter, Reddit, and Instagram caption formats
-```
