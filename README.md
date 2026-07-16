@@ -1,13 +1,13 @@
 # ⚡ Viral Post Predictor
 
-ML-powered virality scoring + Claude AI rewriting for Twitter, Reddit & Instagram posts.
+ML-powered virality scoring + AI rewriting for Twitter, Reddit & Instagram posts.
 
 ## What it does
 
 Paste any social media post → get:
 - A **virality score (0–100)** from an XGBoost ML model
 - A **per-feature breakdown** showing exactly what's helping vs hurting
-- A **Claude-powered rewrite** that fixes the specific weak signals
+- A **LLM-powered rewrite** that fixes the specific weak signals
 - A **before/after score comparison** after rewriting
 
 ## Tech stack
@@ -16,7 +16,7 @@ Paste any social media post → get:
 |---|---|
 | Feature engineering | VADER sentiment, textstat, regex |
 | ML model | XGBoost + SHAP explainability |
-| LLM rewrite | Anthropic Claude API (claude-sonnet-4-6) |
+| LLM rewrite |
 | Frontend | Streamlit + Plotly |
 
 ## Features the model scores
