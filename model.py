@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, GroupKFold
 from sklearn.metrics import classification_report
 import shap
 import pickle
@@ -180,6 +180,13 @@ def extract_features(text: str, platform: str = "twitter") -> dict:
         "first_person": first_person,
         "has_contrast": has_contrast,
         "has_cta": has_cta,
+        # Platform one-hot — without this the model has no way to know that
+        # e.g. a high hashtag_count means something different on Instagram
+        # than on Twitter or Reddit, so it ends up learning a single global
+        # (and often wrong) rule from whichever platform dominates the signal.
+        "platform_twitter": int(platform == "twitter"),
+        "platform_reddit": int(platform == "reddit"),
+        "platform_instagram": int(platform == "instagram"),
     }
 
 
@@ -291,13 +298,25 @@ INSTAGRAM_FLOP = [
 
 def generate_platform_data(platform: str, viral_posts: list, flop_posts: list,
                             n_per_class: int = 500) -> list:
-    """Generate labeled records for a specific platform."""
+    """Generate labeled records for a specific platform.
+    Caller is responsible for seeding (see generate_training_data) so that
+    augmentation noise isn't accidentally correlated across platforms.
+
+    Each record carries a "group" id identifying which base example it was
+    augmented from (e.g. "twitter_viral_3"). There are only ~15-20 unique
+    base sentences per class per platform, repeated/lightly-perturbed to
+    fill out n_per_class — so a *random* train/test split would put several
+    near-duplicates of the same sentence on both sides, letting the model
+    "pass the test" by memorization rather than generalization. The group id
+    lets train_model() split by base example instead, so held-out accuracy
+    reflects performance on genuinely unseen writing.
+    """
     records = []
-    np.random.seed(42)
 
     # Viral posts with augmentation
     for i in range(n_per_class):
-        text = viral_posts[i % len(viral_posts)]
+        base_idx = i % len(viral_posts)
+        text = viral_posts[base_idx]
         # Slight variations to augment
         if i >= len(viral_posts):
             words = text.split()
@@ -309,19 +328,22 @@ def generate_platform_data(platform: str, viral_posts: list, flop_posts: list,
             feats = extract_features(text, platform)
             feats["label"] = 1
             feats["text"] = text
+            feats["group"] = f"{platform}_viral_{base_idx}"
             records.append(feats)
         except Exception:
             continue
 
     # Flop posts with augmentation
     for i in range(n_per_class):
-        text = flop_posts[i % len(flop_posts)]
+        base_idx = i % len(flop_posts)
+        text = flop_posts[base_idx]
         if i >= len(flop_posts):
             text = text + f" #{np.random.choice(['coding', 'tech', 'dev', 'python', 'ml'])}" * np.random.randint(1, 4)
         try:
             feats = extract_features(text, platform)
             feats["label"] = 0
             feats["text"] = text
+            feats["group"] = f"{platform}_flop_{base_idx}"
             records.append(feats)
         except Exception:
             continue
@@ -374,11 +396,12 @@ def load_real_data(n: int = 2000) -> list:
         df_balanced = pd.concat([viral_df, flop_df])
 
         records = []
-        for _, row in df_balanced.iterrows():
+        for row_idx, row in df_balanced.iterrows():
             try:
                 feats = extract_features(str(row["text"]), "twitter")
                 feats["label"] = int(row["label"])
                 feats["text"] = row["text"]
+                feats["group"] = f"real_{row_idx}"  # each real tweet is its own group
                 records.append(feats)
             except Exception:
                 continue
@@ -394,6 +417,8 @@ def load_real_data(n: int = 2000) -> list:
 def generate_training_data() -> pd.DataFrame:
     """Build full training set: curated platform data + real CSV data."""
     records = []
+    np.random.seed(42)  # seed once, here, so the three platform calls below
+                         # don't each restart from the same random sequence
 
     print("Building platform-aware training data...")
 
@@ -458,40 +483,96 @@ FEATURE_LABELS = {
 }
 
 
+def _build_classifier(early_stopping: bool) -> XGBClassifier:
+    """Single source of truth for model hyperparameters, so the CV pass and
+    the final fit always use the identical (regularized) configuration.
+
+    Compared to the original config (max_depth=6, no regularization, no
+    early stopping), this is deliberately shallower and more penalized:
+    the previous settings reached 100%/100% train/test accuracy, which is
+    a classic overfitting signature on a synthetic dataset this small —
+    the model was memorizing exact training examples rather than learning
+    generalizable virality signals, which is why held-out rewrites could
+    score wildly differently from run to run.
+    """
+    kwargs = dict(
+        n_estimators=300,
+        max_depth=4,              # was 6 — shallower trees generalize better
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=6,       # was 3 — require more evidence per split
+        gamma=0.2,                # was 0.1 — higher min loss-reduction to split
+        reg_alpha=0.5,            # L1 regularization (new)
+        reg_lambda=2.0,           # L2 regularization (new)
+        eval_metric="logloss",
+        random_state=42,
+        n_jobs=1,                 # forces deterministic tree building —
+                                   # XGBoost's multi-threaded histogram method
+                                   # can produce different splits on different
+                                   # runs even with a fixed random_state
+    )
+    if early_stopping:
+        kwargs["early_stopping_rounds"] = 20
+    return XGBClassifier(**kwargs)
+
+
 def train_model():
     print("Generating training data...")
     df = generate_training_data()
 
     X = df[FEATURE_COLS].values
     y = df["label"].values
+    groups = df["group"].values
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+    # ── Honest generalization estimate ──────────────────────────────────
+    # Each base sentence is augmented into ~20-40 near-duplicate records
+    # (see generate_platform_data). A random/stratified split ignores that
+    # and happily puts near-duplicates of the same sentence on both sides
+    # of train/test — which is exactly how the old code reported 100%/100%
+    # accuracy: the model wasn't being tested on anything it hadn't already
+    # half-seen. GroupKFold instead keeps every augmentation of a given
+    # base sentence together on one side, so the reported score reflects
+    # performance on genuinely unseen writing.
+    print("\nRunning 5-fold grouped cross-validation (grouped by base example)...")
+    n_groups = len(set(groups))
+    n_splits = min(5, n_groups)
+    cv = GroupKFold(n_splits=n_splits)
+    cv_scores = []
+    for fold, (train_idx, val_idx) in enumerate(cv.split(X, y, groups=groups), start=1):
+        fold_scaler = StandardScaler()
+        X_tr = fold_scaler.fit_transform(X[train_idx])
+        X_val = fold_scaler.transform(X[val_idx])
+        fold_model = _build_classifier(early_stopping=False)
+        fold_model.fit(X_tr, y[train_idx])
+        fold_acc = fold_model.score(X_val, y[val_idx])
+        cv_scores.append(fold_acc)
+        print(f"  Fold {fold}: accuracy = {fold_acc:.3f}")
+    cv_scores = np.array(cv_scores)
+    print(f"Grouped cross-val accuracy: {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+    print("(This is the number to report/trust — it's evaluated on base")
+    print(" sentences the model never saw any augmented copy of.)")
+
+    # ── Final model, trained on a held-out split with early stopping ────
+    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_idx, test_idx = next(splitter.split(X, y, groups=groups))
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
 
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_test_s  = scaler.transform(X_test)
 
-    print("Training XGBoost...")
-    model = XGBClassifier(
-        n_estimators=300,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.85,
-        colsample_bytree=0.85,
-        min_child_weight=3,
-        gamma=0.1,
-        eval_metric="logloss",
-        random_state=42,
-    )
+    print("\nTraining final XGBoost model...")
+    model = _build_classifier(early_stopping=True)
     model.fit(
         X_train_s, y_train,
         eval_set=[(X_test_s, y_test)],
         verbose=False,
     )
+    print(f"Stopped at boosting round: {model.best_iteration}")
 
-    print("\nModel performance:")
+    print("\nHeld-out test performance (grouped split, unseen base sentences):")
     preds = model.predict(X_test_s)
     print(classification_report(y_test, preds, target_names=["Not Viral", "Viral"]))
 
@@ -525,6 +606,8 @@ def predict(text: str, platform: str, model, scaler):
 
     breakdown = []
     for i, col in enumerate(FEATURE_COLS):
+        if col.startswith("platform_"):
+            continue  # always constant for a given post — not a useful "signal" to show
         label = FEATURE_LABELS.get(col, col)
         impact = float(shap_vals[i])
         value  = feats[col]

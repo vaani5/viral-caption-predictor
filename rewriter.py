@@ -70,3 +70,52 @@ EXPLANATION: [one sentence explaining the key change you made]"""
             explanation = line.replace("EXPLANATION:", "").strip()
 
     return rewrite, explanation
+
+
+def chat_with_rewriter(
+    messages: list[dict],
+    context: dict | None,
+    api_key: str,
+) -> str:
+    """
+    Conversational rewrite assistant for the floating chatbot widget.
+
+    `messages` — full chat history so far: [{"role": "user"|"assistant", "content": str}, ...]
+    `context`  — the currently-scored post (st.session_state.result), or None if
+                 nothing has been scored yet. Expected keys: text, platform, score, weaknesses.
+
+    Returns the assistant's plain-text reply.
+    """
+    if context:
+        weakness_block = (
+            "\n".join(f"  • {w}" for w in context.get("weaknesses", []))
+            or "  • None flagged"
+        )
+        system_prompt = f"""You are a friendly, sharp social-media copywriting assistant living inside a virality-scoring tool. You chat casually — short, punchy replies, not essays.
+
+The user is currently working on this {context.get('platform', 'post')} post, which an ML model scored {context.get('score', '?')}/100 for virality:
+"{context.get('text', '')}"
+
+ML-detected weaknesses on the current version:
+{weakness_block}
+
+Help the user rewrite, tighten, or brainstorm the post through conversation — they might ask for a different tone, a shorter version, a platform switch, or just general advice. Whenever you hand back a rewritten version of the post, put it on its own line prefixed with "Here's a rewrite:" followed by the text in quotes, so it's easy to spot and copy. Keep the core meaning intact unless the user explicitly asks you to change it. Never invent facts that weren't in the original."""
+    else:
+        system_prompt = """You are a friendly, sharp social-media copywriting assistant living inside a virality-scoring tool. You chat casually — short, punchy replies, not essays.
+
+No post has been scored yet, so you don't have ML weaknesses to work from. Help the user brainstorm or draft post ideas conversationally, and nudge them to paste a post and hit "Score this post" first so you can give sharper, data-backed rewrite help."""
+
+    client = Groq(api_key=api_key)
+
+    api_messages = [{"role": "system", "content": system_prompt}]
+    for m in messages[-12:]:  # keep recent context only
+        api_messages.append({"role": m["role"], "content": m["content"]})
+
+    chat_completion = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=api_messages,
+        max_tokens=500,
+        temperature=0.8,
+    )
+
+    return chat_completion.choices[0].message.content.strip()
